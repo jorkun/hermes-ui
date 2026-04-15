@@ -38,6 +38,20 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Hermes Agent Desktop Client",
-    "longDescription": "A beautiful desktop GUI for Hermes Agent with chat, config management, and memory."
+    "longDescription": "A beautiful desktop GUI for Hermes Agent with chat, config management, and memory.",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "wix": null,
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "headerImage": null,
+        "sidebarImage": null,
+        "licenseFile": null,
+        "installMode": "currentUser",
+        "languages": ["English", "SimpChinese"]
+      }
+    }
   }
 }
