@@ -4,9 +4,9 @@
 
 ## 界面预览
 
-![界面预览](./public/images/image.png)
+![界面预览](./images/image.png)
 
-![界面预览](./public/images/image2.png)
+![界面预览](./images/image2.png)
 
 ## 功能
 
@@ -24,22 +24,44 @@
 
 ## 开发
 
+### 前置要求
+
+- Node.js 22+ (推荐)
+- pnpm 9+
+- Rust (安装 Rust: https://rustup.rs/)
+
+### 安装依赖
+
 ```bash
-# 安装依赖
 pnpm install
+```
 
-# 开发模式
+### 开发模式
+
+```bash
 pnpm tauri dev
+```
 
-# 构建
+### 构建
+
+```bash
 pnpm tauri build
 ```
 
 ## 启动 Bridge Server
 
+### macOS / Linux
+
 ```bash
 cd ~/.hermes/hermes-agent
 ./venv/bin/python3 server/chat_bridge.py
+```
+
+### Windows
+
+```powershell
+cd %USERPROFILE%\.hermes\hermes-agent
+python server\chat_bridge.py
 ```
 
 ## 项目结构
@@ -50,6 +72,7 @@ hermes-gui/
 │   ├── pages/          # 页面组件
 │   ├── stores/          # Pinia 状态管理
 │   └── ...
+├── images/             # 文档图片
 ├── server/             # Bridge Server
 │   └── chat_bridge.py  # WebSocket 桥接服务
 └── src-tauri/          # Tauri 桌面应用
@@ -66,12 +89,6 @@ export ANTHROPIC_API_KEY=your_key  # Claude
 ```
 
 ## Windows 支持
-
-### 前置要求
-
-- Python 3.8+
-- Node.js 18+
-- Rust (安装 Rust: https://rustup.rs/)
 
 ### 构建步骤
 
