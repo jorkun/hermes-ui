@@ -2,6 +2,12 @@
 
 基于 Tauri + Vue 3 的 Hermes Agent 图形界面客户端。
 
+## 界面预览
+
+![界面预览](public/images/image.png)
+
+![界面预览](public/images/image2.png)
+
 ## 功能
 
 - 🤖 多模型支持（Qwen、DeepSeek、Claude 等）
