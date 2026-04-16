@@ -33,6 +33,18 @@ export interface SessionData {
   updated_at: number
 }
 
+export interface ProjectConfig {
+  id: string
+  name: string
+  path: string
+}
+
+export interface FileItem {
+  path: string
+  name: string
+  type: 'file' | 'directory'
+}
+
 // 检查 Bridge 是否运行
 async function checkBridge(): Promise<boolean> {
   try {
@@ -65,6 +77,77 @@ async function loadSessionFromServer(sessionId: string): Promise<SessionData | n
   return null
 }
 
+// 项目 API
+async function loadProjects(): Promise<ProjectConfig[]> {
+  try {
+    const res = await fetch(`${HTTP_URL}/api/projects`)
+    if (res.ok) {
+      const data = await res.json()
+      return data.projects || []
+    }
+  } catch (e) { console.error('加载项目失败', e) }
+  return []
+}
+
+async function createProject(name: string, path: string): Promise<ProjectConfig | null> {
+  try {
+    const res = await fetch(`${HTTP_URL}/api/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, path })
+    })
+    if (res.ok) {
+      const data = await res.json()
+      return data.project
+    }
+  } catch (e) { console.error('创建项目失败', e) }
+  return null
+}
+
+async function deleteProject(projectId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${HTTP_URL}/api/projects/${projectId}`, { method: 'DELETE' })
+    return res.ok
+  } catch (e) { console.error('删除项目失败', e) }
+  return false
+}
+
+async function loadFiles(dirPath: string, pattern: string = '*'): Promise<FileItem[]> {
+  try {
+    const res = await fetch(`${HTTP_URL}/api/files?path=${encodeURIComponent(dirPath)}&pattern=${encodeURIComponent(pattern)}`)
+    if (res.ok) {
+      const data = await res.json()
+      return data.files || []
+    }
+  } catch (e) { console.error('加载文件失败', e) }
+  return []
+}
+
+async function analyzeCode(filePath: string, issue: string): Promise<string> {
+  try {
+    const res = await fetch(`${HTTP_URL}/api/code/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: filePath, issue })
+    })
+    if (res.ok) {
+      const data = await res.json()
+      return data.analysis || ''
+    }
+  } catch (e) { console.error('分析代码失败', e) }
+  return ''
+}
+
+// 图片转 base64
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<Message[]>([])
   const currentSessionId = ref<string | null>(null)
@@ -75,6 +158,14 @@ export const useChatStore = defineStore('chat', () => {
 
   const availableModels = ref<ModelConfig[]>([...DEFAULT_MODELS])
   const currentModel = ref('qwen3.6-plus')
+  
+  // 项目相关
+  const projects = ref<ProjectConfig[]>([])
+  const currentProject = ref<ProjectConfig | null>(null)
+  const projectFiles = ref<FileItem[]>([])
+  
+  // 图片相关
+  const pendingImages = ref<Array<{ file: File, base64: string }>>([])
 
   let ws: WebSocket | null = null
   let msgId = 0
@@ -115,13 +206,71 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // 加载项目列表
+  async function loadProjectsList() {
+    projects.value = await loadProjects()
+  }
+
+  // 添加项目
+  async function addProject(name: string, path: string) {
+    const project = await createProject(name, path)
+    if (project) {
+      projects.value.push(project)
+      return project
+    }
+    return null
+  }
+
+  // 删除项目
+  async function removeProject(projectId: string) {
+    const success = await deleteProject(projectId)
+    if (success) {
+      projects.value = projects.value.filter(p => p.id !== projectId)
+      if (currentProject.value?.id === projectId) {
+        currentProject.value = null
+      }
+    }
+  }
+
+  // 选择项目
+  function selectProject(project: ProjectConfig) {
+    currentProject.value = project
+  }
+
+  // 加载项目文件
+  async function loadProjectFiles(dirPath: string, pattern: string = '*') {
+    projectFiles.value = await loadFiles(dirPath, pattern)
+    return projectFiles.value
+  }
+
+  // 分析代码
+  async function analyzeCodeIssue(filePath: string, issue: string) {
+    return await analyzeCode(filePath, issue)
+  }
+
+  // 添加图片
+  async function addImage(file: File) {
+    const base64 = await fileToBase64(file)
+    pendingImages.value.push({ file, base64 })
+  }
+
+  // 移除图片
+  function removeImage(index: number) {
+    pendingImages.value.splice(index, 1)
+  }
+
+  // 清空图片
+  function clearImages() {
+    pendingImages.value = []
+  }
+
   // 定期检查 Bridge 状态
   function startBridgeCheck() {
     if (checkInterval) clearInterval(checkInterval)
     checkBridge().then(ok => {
       bridgeStatus.value = ok ? 'online' : 'offline'
       if (!ok) {
-        connectionError.value = 'Bridge 未启动'
+        connectionError.value = 'Bridge 未连接'
       }
     })
     checkInterval = setInterval(async () => {
@@ -135,7 +284,6 @@ export const useChatStore = defineStore('chat', () => {
 
   function connect(): Promise<void> {
     return new Promise(async (resolve, reject) => {
-      // 先检查 Bridge
       const bridgeOk = await checkBridge()
       if (!bridgeOk) {
         bridgeStatus.value = 'offline'
@@ -163,7 +311,6 @@ export const useChatStore = defineStore('chat', () => {
         connected.value = true
         connectionError.value = null
         console.log('[Chat] WebSocket 已连接', ws?.readyState)
-        // 启动 ping
         if (pingTimer) clearInterval(pingTimer)
         pingTimer = setInterval(() => {
           if (ws && ws.readyState === WebSocket.OPEN) {
@@ -188,7 +335,6 @@ export const useChatStore = defineStore('chat', () => {
             loading.value = false
           } else if (d.type === 'done') {
             loading.value = false
-            // 保存会话
             if (currentSessionId.value) {
               saveSession({
                 id: currentSessionId.value,
@@ -217,7 +363,6 @@ export const useChatStore = defineStore('chat', () => {
           clearInterval(pingTimer)
           pingTimer = null
         }
-        // 自动重连
         if (!reconnectTimer) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null
@@ -237,9 +382,17 @@ export const useChatStore = defineStore('chat', () => {
 
   async function sendMessage(text: string) {
     if (loading.value) return
-    const userMsg = { id: `msg_${++msgId}`, role: 'user' as const, content: text, timestamp: Date.now() }
+    
+    const userMsg = { 
+      id: `msg_${++msgId}`, 
+      role: 'user' as const, 
+      content: text, 
+      timestamp: Date.now(),
+      images: pendingImages.value.length > 0 ? pendingImages.value.map(img => img.base64) : undefined
+    }
     messages.value.push(userMsg)
     loading.value = true
+    
     try {
       await connect()
       const modelCfg = availableModels.value.find(m => m.id === currentModel.value)
@@ -249,11 +402,15 @@ export const useChatStore = defineStore('chat', () => {
         model: currentModel.value,
         model_config: modelCfg,
         session_id: currentSessionId.value,
+        images: pendingImages.value.length > 0 ? pendingImages.value.map(img => img.base64) : [],
       }))
+      
+      // 发送后清空图片
+      clearImages()
     } catch (e: any) {
       loading.value = false
       connectionError.value = e.message
-      messages.value.push({ id: `msg_${++msgId}`, role: 'assistant', content: '', timestamp: Date.now(), error: `连接失败: ${e.message}` })
+      messages.value.push({ id: `msg_${++msgId}`, role: 'assistant', content: '', timestamp: Date.now(), error: `连接失败：${e.message}` })
     }
   }
 
@@ -272,7 +429,6 @@ export const useChatStore = defineStore('chat', () => {
   function clearMessages() { messages.value = [] }
   function newSession() { currentSessionId.value = null; messages.value = [] }
 
-  // 辅助函数
   function _getSessionTitle(): string {
     const firstUserMsg = messages.value.find(m => m.role === 'user')
     if (firstUserMsg) {
@@ -282,7 +438,6 @@ export const useChatStore = defineStore('chat', () => {
     return '新会话'
   }
 
-  // 加载历史会话
   async function loadSession(sessionId: string) {
     const session = await loadSessionFromServer(sessionId)
     if (session) {
@@ -295,16 +450,15 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // 创建新会话
   function createSession() {
     currentSessionId.value = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     messages.value = []
   }
 
-  // 初始化新会话
   createSession()
   loadCustomModels()
   startBridgeCheck()
+  loadProjectsList()
 
   return {
     messages,
@@ -315,6 +469,10 @@ export const useChatStore = defineStore('chat', () => {
     bridgeStatus,
     availableModels,
     currentModel,
+    projects,
+    currentProject,
+    projectFiles,
+    pendingImages,
     addCustomModel,
     removeCustomModel,
     sendMessage,
@@ -324,6 +482,15 @@ export const useChatStore = defineStore('chat', () => {
     clearMessages,
     newSession,
     loadSession,
-    createSession
+    createSession,
+    loadProjectsList,
+    addProject,
+    removeProject,
+    selectProject,
+    loadProjectFiles,
+    analyzeCodeIssue,
+    addImage,
+    removeImage,
+    clearImages,
   }
 })

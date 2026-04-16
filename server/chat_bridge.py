@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hermes Bridge Server v0.7 — 支持自定义 API Key
+Hermes Bridge Server v0.8 — 支持上下文记忆、图片、项目目录、编码修复
 """
 
 import asyncio
@@ -9,7 +9,9 @@ import logging
 import os
 import sys
 import uuid
+import base64
 from pathlib import Path
+from typing import Optional
 
 HERMES_ROOT = Path.home() / ".hermes" / "hermes-agent"
 if str(HERMES_ROOT) not in sys.path:
@@ -24,7 +26,7 @@ try:
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
 except ImportError as e:
-    print(f"缺少依赖: {e}")
+    print(f"缺少依赖：{e}")
     sys.exit(1)
 
 logging.basicConfig(
@@ -36,6 +38,10 @@ log = logging.getLogger("hermes-bridge")
 HERMES_HOME = Path.home() / ".hermes"
 SESSIONS_DIR = HERMES_HOME / "hermes-gui-sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 项目目录存储
+PROJECTS_DIR = HERMES_HOME / "hermes-projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MODEL_CONFIGS = {
     "qwen3.6-plus": {"provider": "custom", "api_mode": "anthropic_messages", "base_url": "https://coding.dashscope.aliyuncs.com/apps/anthropic"},
@@ -50,7 +56,7 @@ DEFAULT_MODEL_CONFIGS = {
 def read_file(path: str) -> tuple[str, str]:
     try:
         p = Path(os.path.expanduser(os.path.expandvars(path)))
-        if not p.exists(): return "", f"不存在: {path}"
+        if not p.exists(): return "", f"不存在：{path}"
         return p.read_text(encoding="utf-8"), ""
     except Exception as e: return "", str(e)
 
@@ -61,6 +67,59 @@ def write_file(path: str, content: str) -> str:
         p.write_text(content, encoding="utf-8")
         return ""
     except Exception as e: return str(e)
+
+def list_files(dir_path: str, pattern: str = "*") -> list:
+    """列出目录下的文件"""
+    try:
+        p = Path(os.path.expanduser(os.path.expandvars(dir_path)))
+        if not p.exists(): return []
+        return [str(f) for f in p.glob(pattern) if f.is_file()]
+    except: return []
+
+def save_project(project_id: str, name: str, path: str) -> str:
+    """保存项目配置"""
+    config = {"id": project_id, "name": name, "path": path}
+    project_file = PROJECTS_DIR / f"{project_id}.json"
+    project_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return ""
+
+def load_project(project_id: str) -> Optional[dict]:
+    """加载项目配置"""
+    project_file = PROJECTS_DIR / f"{project_id}.json"
+    if not project_file.exists(): return None
+    return json.loads(project_file.read_text(encoding="utf-8"))
+
+def list_projects() -> list:
+    """列出所有项目"""
+    projects = []
+    for f in PROJECTS_DIR.glob("*.json"):
+        try:
+            projects.append(json.loads(f.read_text(encoding="utf-8")))
+        except: pass
+    return projects
+
+def delete_project(project_id: str) -> str:
+    """删除项目"""
+    project_file = PROJECTS_DIR / f"{project_id}.json"
+    if project_file.exists():
+        project_file.unlink()
+        return ""
+    return f"项目不存在：{project_id}"
+
+def analyze_code(file_path: str, issue: str) -> str:
+    """分析代码问题"""
+    content, error = read_file(file_path)
+    if error: return f"读取文件失败：{error}"
+    
+    return f"""文件：{file_path}
+问题：{issue}
+
+文件内容:
+```
+{content}
+```
+
+请分析上述代码中的问题并提供修复建议。"""
 
 _agent_cache: dict = {}
 
@@ -76,12 +135,10 @@ def get_agent(model: str, model_config: dict | None = None, session_id: str | No
     cfg = load_config()
     env = load_env()
 
-    # 使用传入的配置或默认值
     if model_config:
         provider = model_config.get("provider", "custom")
         api_mode = model_config.get("api_mode") or None
         base_url = model_config.get("base_url") or None
-        # 优先使用传入的 api_key，否则使用环境变量
         api_key = model_config.get("api_key") or ""
     else:
         model_cfg = DEFAULT_MODEL_CONFIGS.get(model, {})
@@ -90,7 +147,6 @@ def get_agent(model: str, model_config: dict | None = None, session_id: str | No
         base_url = model_cfg.get("base_url")
         api_key = ""
 
-    # 如果没有传入 api_key，尝试从环境变量获取
     if not api_key:
         if provider == "anthropic":
             api_key = env.get("ANTHROPIC_API_KEY", "")
@@ -98,227 +154,235 @@ def get_agent(model: str, model_config: dict | None = None, session_id: str | No
             api_key = env.get("DASHSCOPE_API_KEY") or env.get("ANTHROPIC_API_KEY") or ""
         elif provider == "openai":
             api_key = env.get("OPENAI_API_KEY", "")
-        elif provider == "deepseek":
-            api_key = env.get("DEEPSEEK_API_KEY") or env.get("OPENAI_API_KEY", "")
-    
-    if not api_key:
-        log.warning(f"[Agent] 未找到 API Key for provider: {provider}")
 
-    kwargs = {
-        "model": model,
-        "provider": provider,
-        "max_tokens": 8192,
-    }
-    if api_mode:
-        kwargs["api_mode"] = api_mode
-    if base_url:
-        kwargs["base_url"] = base_url
-    if api_key:
-        kwargs["api_key"] = api_key
-
-    has_key_flag = bool(api_key)
-    log.info(f"Agent: model={model}, provider={provider}, api_mode={api_mode}, base_url={base_url}, has_key={has_key_flag}")
-    
-    try:
-        agent = AIAgent(**kwargs)
-    except Exception as e:
-        log.error(f"创建 Agent 失败: {e}")
-        raise
-
-    if session_id:
-        agent.session_id = session_id
+    agent = AIAgent(
+        model=model,
+        provider=provider,
+        api_mode=api_mode,
+        base_url=base_url,
+        api_key=api_key,
+        session_id=session_id,
+    )
     _agent_cache[cache_key] = agent
     return agent
 
-async def ws_chat_endpoint(websocket):
-    cid = str(uuid.uuid4())[:8]
-    log.info(f"[{cid}] WS 连接 from {websocket.client}")
-    await websocket.accept()
-    agent, session_id, current_model, current_config = None, None, None, None
+async def handle_chat(websocket, path):
+    """处理聊天 WebSocket 连接"""
+    log.info(f"新聊天连接：{websocket.client}")
+    
+    current_session_id = None
+    current_model = "qwen3.6-plus"
+    current_model_config = None
+    message_history = []  # 保存当前会话的完整历史
+    agent = None
+    
     try:
-        while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
-            t = msg.get("type")
-            content = msg.get("content", "").strip()
-            session_id = msg.get("session_id") or session_id
-            current_model = msg.get("model") or current_model or "qwen3.6-plus"
-            current_config = msg.get("model_config") or current_config
-
-            if t == "message" and content:
-                try:
-                    agent = get_agent(current_model, current_config, session_id)
-                    log.info(f"[{cid}] → model={current_model}, has_config={current_config is not None}")
-                    result = agent.run_conversation(
-                        user_message=content,
-                        conversation_history=[],
-                        task_id=session_id or str(uuid.uuid4()),
-                    )
-                    err = result.get("error")
-                    text = result.get("final_response", "")
-
-                    if err:
-                        await websocket.send_json({"type": "error", "message": str(err)[:500]})
-                    elif text:
-                        await websocket.send_json({"type": "start"})
-                        for i in range(0, len(text), 10):
-                            await websocket.send_json({"type": "chunk", "content": text[i:i+10]})
-                            await asyncio.sleep(0.01)
-                        await websocket.send_json({"type": "done"})
-                        session_id = result.get("session_id") or result.get("task_id") or session_id
-                    else:
-                        await websocket.send_json({"type": "error", "message": "无响应返回"})
-                except Exception as e:
-                    log.exception(f"[{cid}] Agent 错误")
-                    await websocket.send_json({"type": "error", "message": str(e)[:300]})
-
-            elif t == "ping":
-                await websocket.send_json({"type": "pong"})
-            elif t == "interrupt":
-                if agent:
+        async for message in websocket.iter_text():
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type")
+                
+                if msg_type == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+                
+                if msg_type == "message":
+                    content = data.get("content", "")
+                    current_model = data.get("model", current_model)
+                    current_model_config = data.get("model_config")
+                    session_id = data.get("session_id")
+                    images = data.get("images", [])  # 图片列表 (base64)
+                    
+                    if session_id != current_session_id:
+                        # 会话变更，清空历史
+                        current_session_id = session_id
+                        message_history = []
+                        agent = None
+                    
+                    # 获取或创建 Agent
+                    if not agent:
+                        agent = get_agent(current_model, current_model_config, current_session_id)
+                    
+                    # 添加用户消息到历史
+                    user_msg = {"role": "user", "content": content}
+                    if images:
+                        # 如果有图片，添加图片到消息
+                        user_msg["images"] = images
+                    message_history.append(user_msg)
+                    
+                    log.info(f"收到消息 (会话:{current_session_id}, 历史:{len(message_history)} 条)")
+                    
+                    # 发送开始标记
+                    await websocket.send_text(json.dumps({"type": "start"}))
+                    
+                    # 构建带上下文的请求
+                    response_content = ""
                     try:
-                        agent.interrupt()
-                        await websocket.send_json({"type": "info", "message": "已中断"})
-                    except Exception:
-                        pass
+                        # 使用完整历史对话调用 Agent
+                        # run_conversation 支持 conversation_history 参数
+                        log.info(f"调用 Agent (历史：{len(message_history)} 条消息)")
+                        
+                        # 提取最后一条用户消息
+                        current_user_msg = message_history[-1]["content"] if message_history else content
+                        
+                        # 获取之前的对话历史（不包括最后一条用户消息）
+                        prev_history = message_history[:-1] if len(message_history) > 1 else None
+                        
+                        # 同步调用 run_conversation（在 executor 中运行避免阻塞）
+                        loop = asyncio.get_event_loop()
+                        
+                        def run_agent_sync():
+                            try:
+                                result = agent.run_conversation(
+                                    user_message=current_user_msg,
+                                    conversation_history=prev_history,
+                                )
+                                # 提取响应文本
+                                if isinstance(result, dict):
+                                    return result.get("response", "") or result.get("assistant_message", "")
+                                return str(result) if result else ""
+                            except Exception as e:
+                                log.error(f"Agent 执行失败：{e}")
+                                raise
+                        
+                        response_content = await loop.run_in_executor(None, run_agent_sync)
+                        
+                        # 添加助手响应到历史
+                        if response_content:
+                            message_history.append({"role": "assistant", "content": response_content})
+                            
+                            # 流式发送响应
+                            for i, chunk in enumerate(response_content):
+                                await websocket.send_text(json.dumps({"type": "chunk", "content": chunk}))
+                                if i % 50 == 0:  # 每 50 个字符发送一次
+                                    await asyncio.sleep(0.01)
+                        else:
+                            log.warning("Agent 返回空响应")
+                            await websocket.send_text(json.dumps({"type": "error", "message": "Agent 返回空响应"}))
+                        
+                    except Exception as e:
+                        log.error(f"Agent 调用失败：{e}")
+                        await websocket.send_text(json.dumps({"type": "error", "message": f"Agent 错误：{str(e)}"}))
+                        continue
+                    
+                    # 发送完成标记
+                    await websocket.send_text(json.dumps({"type": "done"}))
+                    
+                    # 自动保存会话
+                    if current_session_id:
+                        session_file = SESSIONS_DIR / f"{current_session_id}.json"
+                        session_data = {
+                            "id": current_session_id,
+                            "model": current_model,
+                            "messages": message_history,
+                            "updated_at": int(asyncio.get_event_loop().time() * 1000),
+                        }
+                        session_file.write_text(json.dumps(session_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                
+                elif msg_type == "interrupt":
+                    log.info("用户中断生成")
+                    # TODO: 实现中断逻辑
+                    
+            except json.JSONDecodeError:
+                log.error(f"无效 JSON: {message}")
+            except Exception as e:
+                log.error(f"处理消息失败：{e}")
+    
     except Exception as e:
-        log.info(f"[{cid}] WS 结束: {e}")
-    finally:
-        for key in list(_agent_cache.keys()):
-            if session_id and session_id in key:
-                del _agent_cache[key]
+        log.error(f"聊天连接错误：{e}")
 
-async def health(request):
-    return JSONResponse({"status": "ok", "service": "hermes-bridge", "v": "0.7.0"})
+async def handle_health(request):
+    return JSONResponse({"status": "ok", "version": "0.8.0"})
 
-async def memory_list(request):
-    mem = HERMES_HOME / "memories"
-    files = [{"name": f.name, "size": f.stat().st_size}
-             for f in sorted(mem.glob("*.md"))] if mem.exists() else []
-    return JSONResponse({"files": files})
-
-async def memory_read(request):
-    file = request.query_params.get("file", "MEMORY.md")
-    path = HERMES_HOME / "memories" / file
-    content, err = read_file(str(path))
-    if err: return JSONResponse({"error": err}, status_code=404)
-    return JSONResponse({"file": file, "content": content})
-
-async def memory_write(request):
-    try:
-        body = await request.json()
-        file = body.get("file", "MEMORY.md")
-        err = write_file(str(HERMES_HOME / "memories" / file), body.get("content", ""))
-        if err: return JSONResponse({"error": err}, status_code=500)
-        return JSONResponse({"ok": True, "file": file})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-# ============ 会话存储 API ============
-
-def _session_file(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}.json"
-
-def _list_sessions() -> list:
+async def handle_sessions_list(request):
+    """获取会话列表"""
     sessions = []
-    for f in SESSIONS_DIR.glob("*.json"):
+    for f in SESSIONS_DIR.glob("session_*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             sessions.append({
-                "id": data.get("id", f.stem),
-                "title": data.get("title", "未命名"),
-                "created_at": data.get("created_at", 0),
-                "updated_at": data.get("updated_at", 0),
+                "id": data.get("id"),
+                "title": data.get("messages", [{}])[0].get("content", "新会话")[:30],
+                "model": data.get("model"),
+                "updated_at": data.get("updated_at"),
                 "message_count": len(data.get("messages", [])),
-                "model": data.get("model", ""),
             })
-        except:
-            pass
-    return sorted(sessions, key=lambda x: x["updated_at"], reverse=True)
+        except: pass
+    sessions.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return JSONResponse({"sessions": sessions})
 
-async def sessions_list(request):
-    return JSONResponse({"sessions": _list_sessions()})
-
-async def sessions_read(request):
-    sid = request.path_params.get("id")
-    if not sid:
-        return JSONResponse({"error": "缺少 session id"}, status_code=400)
-    f = _session_file(sid)
-    if not f.exists():
+async def handle_session_get(request):
+    """获取会话详情"""
+    session_id = request.path_params.get("id")
+    session_file = SESSIONS_DIR / f"{session_id}.json"
+    if not session_file.exists():
         return JSONResponse({"error": "会话不存在"}, status_code=404)
+    
     try:
-        data = json.loads(f.read_text(encoding="utf-8"))
+        data = json.loads(session_file.read_text(encoding="utf-8"))
         return JSONResponse({"session": data})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-async def sessions_save(request):
+async def handle_projects_list(request):
+    """获取项目列表"""
+    return JSONResponse({"projects": list_projects()})
+
+async def handle_project_create(request):
+    """创建项目"""
     try:
-        body = await request.json()
-        sid = body.get("id")
-        if not sid:
-            return JSONResponse({"error": "缺少 session id"}, status_code=400)
-        f = _session_file(sid)
-        # 合并消息
-        existing = {}
-        if f.exists():
-            try: existing = json.loads(f.read_text(encoding="utf-8"))
-            except: pass
-        existing.update(body)
-        existing["updated_at"] = int(Path(__file__).stat().st_mtime)
-        f.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-        return JSONResponse({"ok": True})
+        data = await request.json()
+        project_id = f"proj_{uuid.uuid4().hex[:8]}"
+        error = save_project(project_id, data.get("name", "未命名"), data.get("path", ""))
+        if error:
+            return JSONResponse({"error": error}, status_code=400)
+        return JSONResponse({"project": {"id": project_id, "name": data.get("name"), "path": data.get("path")}})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-async def sessions_delete(request):
-    sid = request.path_params.get("id")
-    if not sid:
-        return JSONResponse({"error": "缺少 session id"}, status_code=400)
-    f = _session_file(sid)
-    if f.exists():
-        f.unlink()
-    return JSONResponse({"ok": True})
+async def handle_project_delete(request):
+    """删除项目"""
+    project_id = request.path_params.get("id")
+    error = delete_project(project_id)
+    if error:
+        return JSONResponse({"error": error}, status_code=404)
+    return JSONResponse({"success": True})
 
-async def config_read(request):
-    cfg_path = HERMES_HOME / "config.yaml"
-    content, err = read_file(str(cfg_path))
-    if err: return JSONResponse({"error": err}, status_code=404)
-    return JSONResponse({"content": content})
+async def handle_files_list(request):
+    """列出项目文件"""
+    dir_path = request.query_params.get("path", "")
+    pattern = request.query_params.get("pattern", "*")
+    if not dir_path:
+        return JSONResponse({"error": "需要 path 参数"}, status_code=400)
+    return JSONResponse({"files": list_files(dir_path, pattern)})
 
-async def config_write(request):
+async def handle_code_analyze(request):
+    """分析代码问题"""
     try:
-        body = await request.json()
-        err = write_file(str(HERMES_HOME / "config.yaml"), body.get("content", ""))
-        if err: return JSONResponse({"error": err}, status_code=500)
-        return JSONResponse({"ok": True})
+        data = await request.json()
+        result = analyze_code(data.get("file_path", ""), data.get("issue", ""))
+        return JSONResponse({"analysis": result})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 app = Starlette(
+    debug=True,
+    routes=[
+        WebSocketRoute("/ws/chat", handle_chat),
+        Route("/health", handle_health),
+        Route("/api/sessions", handle_sessions_list),
+        Route("/api/sessions/{id}", handle_session_get),
+        Route("/api/projects", handle_projects_list),
+        Route("/api/projects", handle_project_create, methods=["POST"]),
+        Route("/api/projects/{id}", handle_project_delete, methods=["DELETE"]),
+        Route("/api/files", handle_files_list),
+        Route("/api/code/analyze", handle_code_analyze, methods=["POST"]),
+    ],
     middleware=[
         Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
-    ],
-    routes=[
-        Route("/health", health),
-        Route("/memory/list", memory_list),
-        Route("/memory/read", memory_read),
-        Route("/memory/write", memory_write, methods=["PUT"]),
-        Route("/api/sessions", sessions_list),
-        Route("/api/sessions/{id}", sessions_read),
-        Route("/api/sessions/{id}", sessions_save, methods=["PUT"]),
-        Route("/api/sessions/{id}", sessions_delete, methods=["DELETE"]),
-        Route("/config/read", config_read),
-        Route("/config/write", config_write, methods=["PUT"]),
-        WebSocketRoute("/ws/chat", ws_chat_endpoint),
     ],
 )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("HERMES_BRIDGE_PORT", "9120"))
-    log.info(f"═══════════════════════════════════════")
-    log.info(f"  Hermes Bridge Server v0.7.0")
-    log.info(f"  HTTP: http://localhost:{port}/")
-    log.info(f"  WS:   ws://localhost:{port}/ws/chat")
-    log.info(f"═══════════════════════════════════════")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
+    log.info("Hermes Bridge Server v0.8 启动中...")
+    uvicorn.run(app, host="0.0.0.0", port=9120, log_level="info")
